@@ -1,0 +1,663 @@
+/***********************
+ * ==================== CONFIGURATION ====================
+ ***********************/
+const CONFIG = {
+  PAGE_ACCESS_TOKEN: 'EAAP8mm5ayNEBP6WqKkqyznsD6ztEp4JYyrCt5lvPZCycVHMsn9UahkvPgITdJkzzrYym28aPTZADxup1ONYZAQCbZByRupZCeZA0xxJLqj9h7QbO7q9chxuGo5Er2gjS9KS7isXtkqeuEDZASmD5iYgKO0HddVYQYN0QTlJm9K9mxSgIPamywTYSzWLy8tKpI8YArI005ZCO3PCTNzncalcuz3ntqdY5QZAXKNlxmyJsZAArz6M7yLH1rMW09VdfrYhkwZCofBuX77HfuqQWe8TMvmZCDBRBfAZDZD',
+  PAGE_ID: '850058741523151',
+  BLOOD_SUGAR_THRESHOLD: 180
+};
+
+// Scoring weights
+const WEIGHTS = {
+  AGE: 0.10,     // 10%
+  SUGAR: 0.30,   // 30%
+  SYSTOLIC: 0.30,// 30%
+  DIASTOLIC: 0.30// 30%
+};
+
+// Thresholds
+const SYSTOLIC_THRESHOLD = 130;
+const DIASTOLIC_THRESHOLD = 90;
+const AGE_THRESHOLD = 65; // (not used in sort now, kept for reference)
+
+/***********************
+ * = A. FACEBOOK CONTACT MANAGEMENT =
+ ***********************/
+
+// Main: update FB contacts database sheet
+function updateFacebookContacts() {
+  Logger.log("=== Starting Facebook contacts update ===");
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const masterList = ss.getSheetByName("Master List");
+  const fbDatabase = ss.getSheetByName("FB Database");
+
+  if (!masterList || !fbDatabase) {
+    Logger.log("Error: 'Master List' or 'FB Database' sheet not found.");
+    return;
+  }
+
+  const recentConversations = getRecentConversations();
+  if (!recentConversations || recentConversations.length === 0) {
+    Logger.log("No new recent conversations found.");
+    return;
+  }
+
+  const masterData    = masterList.getDataRange().getValues();
+  const existingDbData= fbDatabase.getDataRange().getValues();
+
+  const masterPSIDs = new Set();
+  const dbPSIDs = new Map(); // psid -> row index in sheet (1-based)
+
+  // Populate PSID sets
+  for (var i = 1; i < masterData.length; i++) {
+    if (masterData[i][1]) {
+      masterPSIDs.add(String(masterData[i][1]).trim());
+    }
+  }
+  for (i = 1; i < existingDbData.length; i++) {
+    if (existingDbData[i][1]) {
+      dbPSIDs.set(String(existingDbData[i][1]).trim(), i + 1);
+    }
+  }
+
+  const currentDate = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "ddMMyy");
+
+  const newContacts = [];      // [name, psid, date] not in Master
+  const existingContacts = []; // [name, psid, date] in Master
+  const seen = new Set();
+
+  recentConversations.forEach(function(conv) {
+    const psid = conv.sender && conv.sender.id ? String(conv.sender.id).trim() : "";
+    const name = conv.sender && conv.sender.name ? conv.sender.name : "Unknown User";
+    if (!psid || seen.has(psid)) return;
+    seen.add(psid);
+
+    const row = [name, psid, currentDate];
+    if (masterPSIDs.has(psid)) existingContacts.push(row);
+    else newContacts.push(row);
+  });
+
+  rebuildFBDatabase(fbDatabase, existingDbData, newContacts, existingContacts, masterPSIDs, dbPSIDs);
+  Logger.log("=== Facebook contacts update completed ===");
+}
+
+function rebuildFBDatabase(fbDatabase, existingDbData, newConversations, recentExistingConversations, masterPSIDs, dbPSIDs) {
+  const header = existingDbData.length > 0 ? existingDbData[0] : ["Facebook Name", "PSID", "Date contacted"];
+  const finalData = [];
+
+  const processedRecentPSIDs = new Set(
+    newConversations.concat(recentExistingConversations).map(function(r){ return String(r[1]).trim(); })
+  );
+
+  // Filter old rows (skip header)
+  const oldDataRows = existingDbData.slice(1).map(function(row){
+    var psid = row[1] ? String(row[1]).trim() : '';
+    if (!psid) return row;
+
+    if (recentExistingConversations.some(function(r){return String(r[1]).trim() === psid;})) {
+      return null; // will update below
+    }
+    // Keep rows that were not touched
+    return row;
+  }).filter(function(row){ return row !== null; });
+
+  // Split old rows into new/pending (not in master) vs existing (in master)
+  const oldNewPending = [];
+  const oldExisting = [];
+  oldDataRows.forEach(function(row){
+    var psid = row[1] ? String(row[1]).trim() : '';
+    if (masterPSIDs.has(psid)) oldExisting.push(row);
+    else oldNewPending.push(row);
+  });
+
+  // Update date for recently contacted existing
+  const currentDate = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "ddMMyy");
+  const updatedExistingContacts = recentExistingConversations.map(function(contact){
+    contact[2] = currentDate;
+    return contact;
+  });
+
+  // Build finalData
+  finalData.push.apply(finalData, newConversations);
+  finalData.push.apply(finalData, oldNewPending);
+
+  var allExistingContacts = updatedExistingContacts.concat(oldExisting);
+  allExistingContacts.sort(function(a, b){
+    var na = (a[0] || "").toString().toLowerCase();
+    var nb = (b[0] || "").toString().toLowerCase();
+    return na.localeCompare(nb);
+  });
+  finalData.push.apply(finalData, allExistingContacts);
+
+  // Write back
+  fbDatabase.clearContents();
+  fbDatabase.getRange(1, 1, 1, header.length).setValues([header]);
+  if (finalData.length > 0) {
+    fbDatabase.getRange(2, 1, finalData.length, header.length).setValues(finalData);
+  }
+  Logger.log("FB Database Rebuilt: " + newConversations.length + " new/recent contacts placed on top.");
+}
+
+function getRecentConversations() {
+  try {
+    var since = Math.floor((Date.now() - (24 * 60 * 60 * 1000)) / 1000);
+    var url = "https://graph.facebook.com/v19.0/" + CONFIG.PAGE_ID +
+              "/conversations?fields=participants,updated_time&since=" + since +
+              "&access_token=" + CONFIG.PAGE_ACCESS_TOKEN + "&limit=100";
+
+    var response = UrlFetchApp.fetch(url);
+    var data = JSON.parse(response.getContentText());
+
+    var conversations = [];
+    if (data.data && data.data.length > 0) {
+      data.data.forEach(function(c){
+        if (c.participants && c.participants.data) {
+          var user = c.participants.data.find(function(p){ return p.id !== CONFIG.PAGE_ID; });
+          if (user) {
+            conversations.push({
+              sender: { id: user.id, name: user.name },
+              last_updated: c.updated_time
+            });
+          }
+        }
+      });
+    }
+    return conversations;
+  } catch (err) {
+    Logger.log("Error getting conversations: " + err);
+    return [];
+  }
+}
+
+function sendFacebookMessage(psid, message, tag) {
+  var url = "https://graph.facebook.com/v19.0/me/messages?access_token=" + CONFIG.PAGE_ACCESS_TOKEN;
+  var payload = {
+    recipient: { id: psid },
+    message: { text: message }
+  };
+  if (tag) {
+    payload.messaging_type = "MESSAGE_TAG";
+    payload.tag = tag;
+  } else {
+    payload.messaging_type = "RESPONSE";
+  }
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  var res = UrlFetchApp.fetch(url, options);
+  return res.getContentText();
+}
+
+/***********************
+ * = B. HEALTH RECORD MANAGEMENT =
+ ***********************/
+
+// One-time sheet setup (headers, validation, formatting)
+function setupHealthRecordSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Health Records");
+  if (!sheet) sheet = ss.insertSheet("Health Records");
+
+  const headers = [
+    "Name",           // A (0)
+    "Age",            // B (1)
+    "Blood Sugar Level", // C (2)
+    "Systolic",       // D (3)
+    "Diastolic",      // E (4)
+    "Feedback",       // F (5)
+    "PSID",           // G (6)
+    "Notify",         // H (7)
+    "Status",         // I (8)
+    "Last Send",      // J (9)
+    "Date",           // K (10)  <-- record date
+    "Medicine",
+    "Dosage"
+  ];
+
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+
+  // Status validation
+  const statusRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["Pending", "Sent"])
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange("I2:I").setDataValidation(statusRule);
+
+  // Conditional formatting for C, D, E
+  let rules = sheet.getConditionalFormatRules() || [];
+  // Remove old C/D/E rules
+  rules = rules.filter(function(rule){
+    return !rule.getRanges().some(function(r){
+      var a1 = r.getA1Notation();
+      return a1.indexOf("C") !== -1 || a1.indexOf("D") !== -1 || a1.indexOf("E") !== -1;
+    });
+  });
+
+  const dangerColor = "#FF6666";
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(CONFIG.BLOOD_SUGAR_THRESHOLD)
+      .setBackground(dangerColor)
+      .setRanges([sheet.getRange("C2:C")])
+      .build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(SYSTOLIC_THRESHOLD)
+      .setBackground(dangerColor)
+      .setRanges([sheet.getRange("D2:D")])
+      .build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(DIASTOLIC_THRESHOLD)
+      .setBackground(dangerColor)
+      .setRanges([sheet.getRange("E2:E")])
+      .build()
+  );
+  sheet.setConditionalFormatRules(rules);
+
+  Logger.log("✅ Health Records headers/formatting ready.");
+}
+
+// Message template
+function createHealthMessage() {
+  return "Reminder that your follow up will be soon. Your health vitals showed elevated levels. " +
+         "Please schedule a follow-up appointment with your healthcare provider for further evaluation and management.\n\n" +
+         "Take care of your health!";
+}
+
+// Send reminders (19:00 daily by trigger)
+function sendDailyReminders() {
+  Logger.log("=== Starting daily reminder send ===");
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Health Records");
+  if (!sh) return;
+  const data = sh.getDataRange().getValues();
+  if (data.length <= 1) return;
+
+  const BLOOD_SUGAR_COL = 2; // C
+  const SYSTOLIC_COL    = 3; // D
+  const DIASTOLIC_COL   = 4; // E
+  const PSID_COL        = 6; // G
+  const NOTIFY_COL      = 7; // H
+  const STATUS_COL      = 8; // I
+  const LAST_SEND_COL   = 9; // J
+
+  const todayStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "ddMMyy");
+
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var bloodSugar = row[BLOOD_SUGAR_COL];
+    var systolic   = row[SYSTOLIC_COL];
+    var diastolic  = row[DIASTOLIC_COL];
+    var psid       = row[PSID_COL];
+    var notify     = row[NOTIFY_COL];
+    var status     = row[STATUS_COL];
+
+    var isHighRisk = (
+      (typeof bloodSugar === 'number' && bloodSugar > CONFIG.BLOOD_SUGAR_THRESHOLD) ||
+      (typeof diastolic  === 'number' && diastolic > DIASTOLIC_THRESHOLD) ||
+      (typeof systolic   === 'number' && systolic  > SYSTOLIC_THRESHOLD)
+    );
+
+    var ready = (notify === true && status === "Pending" && psid && String(psid).trim().length > 0 && isHighRisk);
+    if (ready) {
+      try {
+        sendFacebookMessage(psid, createHealthMessage());
+        // Update Status, Last Send, uncheck Notify
+        sh.getRange(i + 1, STATUS_COL + 1).setValue("Sent");
+        sh.getRange(i + 1, LAST_SEND_COL + 1).setValue(todayStr);
+        sh.getRange(i + 1, NOTIFY_COL + 1).setValue(false);
+        Utilities.sleep(400);
+      } catch (err) {
+        Logger.log("FAILED to send to row " + (i+1) + ": " + err);
+      }
+    }
+  }
+  Logger.log("=== Daily reminder send completed ===");
+}
+
+/***********************
+ * = C. AUTOMATION TRIGGERS =
+ ***********************/
+function setupAllTriggers() {
+  // Clear existing triggers
+  ScriptApp.getProjectTriggers().forEach(function(t){ ScriptApp.deleteTrigger(t); });
+
+  ScriptApp.newTrigger('updateFacebookContacts')
+    .timeBased().everyDays(1).atHour(7).nearMinute(0).create();
+
+  ScriptApp.newTrigger('checkBloodSugarLevels')
+    .timeBased().everyDays(1).atHour(8).nearMinute(0).create();
+
+  ScriptApp.newTrigger('sendDailyReminders')
+    .timeBased().everyDays(1).atHour(19).nearMinute(0).create();
+
+  Logger.log("✅ Triggers set: FB(7AM), Check(8AM), Reminders(7PM).");
+}
+
+/***********************
+ * = D. INITIAL SETUP & MANUAL RUNS =
+ ***********************/
+function initialSetup() {
+  Logger.log("=== Initial setup ===");
+  setupHealthRecordSheet();
+  setupAllTriggers();
+  Logger.log("=== Initial setup completed ===");
+}
+
+function manualUpdateFacebookContacts(){ updateFacebookContacts(); }
+function manualCheckBloodSugar(){ checkBloodSugarLevels(); }
+function manualSendReminders(){ sendDailyReminders(); }
+
+// OPTIONAL: list page tokens (for manual debugging)
+function getPageAccessToken() {
+  const USER_ACCESS_TOKEN = 'EAAP8mm5ayNEBP6WqKkqyznsD6ztEp4JYyrCt5lvPZCycVHMsn9UahkvPgITdJkzzrYym28aPTZADxup1ONYZAQCbZByRupZCeZA0xxJLqj9h7QbO7q9chxuGo5Er2gjS9KS7isXtkqeuEDZASmD5iYgKO0HddVYQYN0QTlJm9K9mxSgIPamywTYSzWLy8tKpI8YArI005ZCO3PCTNzncalcuz3ntqdY5QZAXKNlxmyJsZAArz6M7yLH1rMW09VdfrYhkwZCofBuX77HfuqQWe8TMvmZCDBRBfAZDZD';
+  try {
+    const url = "https://graph.facebook.com/v19.0/me/accounts?access_token=" + USER_ACCESS_TOKEN;
+    const res = UrlFetchApp.fetch(url);
+    const data = JSON.parse(res.getContentText());
+    data.data.forEach(function(page){
+      Logger.log("- " + page.name + " (" + page.id + "): " + page.access_token);
+    });
+    return data.data[0].access_token;
+  } catch (err) {
+    Logger.log("Error: " + err);
+    return "";
+  }
+}
+
+/***********************
+ * = E. EDIT HANDLER (manual edits only) =
+ *    Stamps Date in K when you type/paste in A:J.
+ *    Automation DOES NOT trigger this (handled in checkBloodSugarLevels()).
+ ***********************/
+function onEdit(e) {
+  var sh = e.range.getSheet();
+  if (!sh || sh.getName() !== "Health Records") return;
+
+  var DATE_COL = 11; // K
+  var A_COL = 1, J_COL = 10;
+  var H_COL = 8, I_COL = 9; // Notify / Status
+
+  var sr = e.range.getRow();// e.range starts with index 1
+  var sc = e.range.getColumn();
+  var nr = e.range.getNumRows();
+  var nc = e.range.getNumColumns();
+
+  var tz = Session.getScriptTimeZone();
+  var today = Utilities.formatDate(new Date(), tz, "ddMMyy");
+
+  // If edit intersects A:J or K, stamp Date when row has data in A:J and K is empty
+  var touchesAJ = !((sc > J_COL) || (sc + nc - 1) < A_COL);
+  var touchesK  = !((sc > DATE_COL) || (sc + nc - 1) < DATE_COL);
+
+  if (touchesAJ || touchesK) {
+    for (var i = 0; i < nr; i++) {
+      var row = sr + i;
+      if (row <= 1) continue;
+      var rowValsAJ = sh.getRange(row, A_COL, 1, J_COL - A_COL + 1).getValues()[0];
+      var hasDataAJ = rowValsAJ.some(function(v){ return v !== "" && v !== null; });
+      var dateCell  = sh.getRange(row, DATE_COL);
+      if (hasDataAJ && !dateCell.getValue()) {
+        dateCell.setValue(today);
+      }
+    }
+  }
+//add checkbox and date if datas are added via automation
+const CHECK_RANGE = { start: 1, end: 6 }; // A–F
+const tz1 = Session.getScriptTimeZone();
+const today1 = Utilities.formatDate(new Date(), tz1, "ddMMyy");
+
+// Only run if edit is within A–F
+if (col >= CHECK_RANGE.start && col <= CHECK_RANGE.end) {
+  const values = sheet.getRange(row, CHECK_RANGE.start, 1, CHECK_RANGE.end).getValues()[0];
+  const hasData = values.some(v => v !== "" && v !== null);
+
+  const notifyCell = sheet.getRange(row, H_COL);
+  const dateCell = sheet.getRange(row, DATE_COL);
+
+  if (hasData) {
+    // Add checkbox if not already present
+    const rule = notifyCell.getDataValidation();
+    if (!notifyCell.getValue()) {
+      notifyCell.insertCheckboxes();
+    }
+
+    // Add today's date in ddMMyy if empty
+    if (!dateCell.getValue()) {
+      dateCell.setValue(today1);
+    }
+  }
+}
+  // Notify -> Status quick sync (manual edits)
+  var touchesNotify = !((sc > H_COL) || (sc + nc - 1) < H_COL);
+  if (touchesNotify) {
+    for (var j = 0; j < nr; j++) {
+      var r = sr + j;
+      if (r <= 1) continue;
+      var notifyVal = sh.getRange(r, H_COL).getValue();
+      var statusCell= sh.getRange(r, I_COL);
+
+      var sugar = sh.getRange(r, 3).getValue();
+      var sys   = sh.getRange(r, 4).getValue();
+      var dia   = sh.getRange(r, 5).getValue();
+
+      var high = (
+        (typeof sugar === 'number' && sugar > CONFIG.BLOOD_SUGAR_THRESHOLD) ||
+        (typeof dia   === 'number' && dia   > DIASTOLIC_THRESHOLD) ||
+        (typeof sys   === 'number' && sys   > SYSTOLIC_THRESHOLD)
+      );
+
+      if (notifyVal === true && high) statusCell.setValue("Pending");
+      else if (!notifyVal) statusCell.clearContent();
+    }
+  }
+}
+
+/***********************
+ * = F. CORE: CHECK + BACKFILL + GROUPED SORT =
+ *   - Backfills Date in K for ANY rows with data (covers automation inserts)
+ *   - Auto-updates Notify/Status
+ *   - Groups by Name, newest row first within group
+ *   - High-risk groups first, by score DESC; then non-high-risk alphabetical
+ ***********************/
+function checkBloodSugarLevels() {
+  Logger.log("=== Starting blood sugar/BP check and sheet reorder (no date) ===");
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Health Records");
+  if (!sheet) {
+    Logger.log("Error: 'Health Records' sheet not found.");
+    return;
+  }
+
+  // Keep header visible and out of the sort range
+  sheet.setFrozenRows(1);
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow <= 1) {
+    Logger.log("No data rows to process.");
+    return;
+  }
+
+  // Read header (row 1) and body (rows 2..end)
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const bodyRange = sheet.getRange(2, 1, lastRow - 1, lastCol);
+  const bodyData = bodyRange.getValues(); // array of rows (no header)
+
+  // --- Column indices (0-indexed in 'bodyData' rows) ---
+  const NAME_COL        = 0; // A: Name
+  const AGE_COL         = 1; // B: Age
+  const BLOOD_SUGAR_COL = 2; // C: Blood Sugar Level
+  const SYSTOLIC_COL    = 3; // D: Systolic
+  const DIASTOLIC_COL   = 4; // E: Diastolic
+  const PSID_COL        = 6; // G: PSID
+  const NOTIFY_COL      = 7; // H: Notify (checkbox)
+  const STATUS_COL      = 8; // I: Status
+
+  // Thresholds
+  const SUGAR_THR = CONFIG.BLOOD_SUGAR_THRESHOLD;
+  const SYS_THR   = SYSTOLIC_THRESHOLD;
+  const DIA_THR   = DIASTOLIC_THRESHOLD;
+
+  // ---- Helpers ----
+  function isHighRisk(row) {
+    const sugar    = Number(row[BLOOD_SUGAR_COL]);
+    const systolic = Number(row[SYSTOLIC_COL]);
+    const diastolic= Number(row[DIASTOLIC_COL]);
+
+    return (
+      (!isNaN(sugar)    && sugar    > SUGAR_THR) ||
+      (!isNaN(diastolic) && diastolic > DIA_THR) ||
+      (!isNaN(systolic)  && systolic  > SYS_THR)
+    );
+  }
+
+  function calcScore(row) {
+    const age      = Number(row[AGE_COL]) || 0;
+    const sugar    = Number(row[BLOOD_SUGAR_COL]) || 0;
+    const systolic = Number(row[SYSTOLIC_COL]) || 0;
+    const diastolic= Number(row[DIASTOLIC_COL]) || 0;
+
+    const normAge       = age / 100;                // simple normalization
+    const normSugar     = sugar / SUGAR_THR;
+    const normSystolic  = systolic / SYS_THR;
+    const normDiastolic = diastolic / DIA_THR;
+
+    // Weighted score (higher = riskier)
+    return (normAge * WEIGHTS.AGE) +
+           (normSugar * WEIGHTS.SUGAR) +
+           (normSystolic * WEIGHTS.SYSTOLIC) +
+           (normDiastolic * WEIGHTS.DIASTOLIC);
+  }
+
+  // Preprocess rows: attach metadata and auto-update Notify/Status
+  bodyData.forEach((row, idx) => {
+    row.__origIndex = idx; // used for stable recency when no Date col
+
+    const high = isHighRisk(row);
+    row.__isHighRisk = high;
+    row.__score = high ? calcScore(row) : -Infinity;
+
+    // Auto Notify/Status (keeps your behavior)
+    const psid = row[PSID_COL];
+    /*if (high ) {
+      if (row[NOTIFY_COL] !== true || row[STATUS_COL] !== "Pending") {
+        row[STATUS_COL] = "Pending";
+        row[NOTIFY_COL] = true;
+      }
+    } else if (!high) {
+      if (row[NOTIFY_COL] === true || row[STATUS_COL] === "Pending") {
+        row[NOTIFY_COL] = false;
+        row[STATUS_COL] = "";
+      }
+    }*/
+  });
+
+  // Group rows by Name (normalize to lower-case trimmed)
+  const nameKey = r => ((r[NAME_COL] || "") + "").trim().toLowerCase();
+  const groupsMap = new Map(); // key -> { name, rows[] }
+
+  bodyData.forEach(row => {
+    const key = nameKey(row);
+    if (!groupsMap.has(key)) groupsMap.set(key, { name: row[NAME_COL] || "", rows: [] });
+    groupsMap.get(key).rows.push(row);
+  });
+
+  // Within each group, put the "newest" row first.
+  // Without a Date column, we use original index: higher index = later in the sheet = newer.
+  const groups = [];
+  groupsMap.forEach(g => {
+    // Sort group's rows by __origIndex descending (newest first)
+    g.rows.sort((a, b) => b.__origIndex - a.__origIndex);
+    g.leader = g.rows[0]; // leader is newest entry
+
+    // Group-level keys from leader (used for sorting groups)
+    g.__isHighRisk = !!g.leader.__isHighRisk;
+    g.__score      = g.__isHighRisk ? g.leader.__score : -Infinity;
+    g.__nameNorm   = nameKey(g.leader);
+
+    groups.push(g);
+  });
+
+  // Sort groups:
+  // 1) All high-risk groups first
+  // 2) Among high-risk: by score DESC
+  // 3) Non-high-risk: by name alphabetically
+  groups.sort((A, B) => {
+    if (A.__isHighRisk && !B.__isHighRisk) return -1;
+    if (!A.__isHighRisk && B.__isHighRisk) return 1;
+
+    if (A.__isHighRisk && B.__isHighRisk) {
+      const diff = B.__score - A.__score;
+      if (diff !== 0) return diff;
+      return A.__nameNorm.localeCompare(B.__nameNorm);
+    }
+
+    // both non-high-risk
+    return A.__nameNorm.localeCompare(B.__nameNorm);
+  });
+
+  // Flatten back: for each group, leader first (newest), then the rest (already newest-first)
+  const flattened = [];
+  groups.forEach(g => flattened.push(...g.rows));
+
+  // Clean temp fields
+  flattened.forEach(row => {
+    delete row.__origIndex;
+    delete row.__isHighRisk;
+    delete row.__score;
+  });
+
+  // Clear and write ONLY the body (keep header intact)
+  bodyRange.clearContent();
+  if (flattened.length > 0) {
+    sheet.getRange(2, 1, flattened.length, lastCol).setValues(flattened);
+  }
+
+  Logger.log("=== Blood sugar/BP reorder completed (no date) ===");
+}
+
+function countRedRows() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Health Records");
+  if (!sheet) {
+    Logger.log("Sheet not found.");
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2) {
+    Logger.log("No data.");
+    return;
+  }
+
+  // We check full data area (row 2 to end)
+  const range = sheet.getRange(2, 1, lastRow - 1, lastCol);
+  const values = range.getValues();
+  const bgColors = range.getBackgrounds();
+
+  const RED_HEX = "#ff6666"; // background color to detect
+  let count = 0;
+
+  // Loop each row
+  for (let r = 0; r < values.length; r++) {
+    let rowHasRed = false;
+    
+    // Loop through cells in row
+    for (let c = 0; c < bgColors[r].length; c++) {
+      if (bgColors[r][c].toLowerCase() === RED_HEX) {
+        rowHasRed = true;
+        break;
+      }
+    }
+
+    if (rowHasRed) count++;
+  }
+
+  Logger.log("Total rows with red highlight: " + count);
+}
+
