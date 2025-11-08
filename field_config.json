@@ -1,0 +1,38 @@
+{
+    "name": {
+        "x": 120,
+        "y": 150,
+        "width": 1220,
+        "height":217
+    },
+    "age": {
+        "x": 122,
+        "y": 507,
+        "width": 230,
+        "height": 173
+    },
+    "blood_sugar": {
+        "x": 122,
+        "y": 842,
+        "width": 245,
+        "height": 175
+    },
+    "systolic": {
+        "x": 125,
+        "y": 1180,
+        "width": 205,
+        "height": 122
+    },
+    "diastolic": {
+        "x": 487,
+        "y": 1182,
+        "width": 223,
+        "height": 118
+    },
+    "feedback": {
+        "x": 115,
+        "y": 1500,
+        "width": 1232,
+        "height": 470
+    }
+}
